@@ -38,7 +38,20 @@ def main():
     if yolo.exists():
         print(f"[OK] YOLO weights: {yolo}")
     else:
-        print(f"[INFO] YOLO weights not present yet. First run will load {config.YOLO_MODEL_NAME}.")
+        ok = False
+        print(f"[FAIL] YOLO weights: {yolo} (first run would download {config.YOLO_MODEL_NAME})")
+
+    try:
+        from yolo_device import cuda_install_hint, describe_device
+        info = describe_device()
+        if info["cuda_available"]:
+            print(f"[OK] Inference device: {info['device']} ({info['reason']})")
+        else:
+            print(f"[WARN] Inference device: cpu ({info['reason']})")
+            print(cuda_install_hint())
+    except Exception as exc:
+        ok = False
+        print(f"[FAIL] device selection: {exc}")
 
     print("[INFO] Voice mode: voice only; no beep implementation is enabled.")
     return 0 if ok else 1

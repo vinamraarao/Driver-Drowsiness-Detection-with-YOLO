@@ -1,5 +1,18 @@
-opencv-python==4.10.0.84
+# Driver monitoring system dependencies.
+# One OpenCV distribution only: MediaPipe 0.10.x requires opencv-contrib-python,
+# which supplies the same cv2 package as opencv-python. Installing both leaves
+# two dist-infos fighting over one importable cv2; keep only this one.
+opencv-contrib-python==4.11.0.86
 numpy==1.26.4
 mediapipe==0.10.35
 ultralytics==8.3.196
+# SAPI5 speech engine on Windows (pulls in comtypes).
 pyttsx3==2.99
+comtypes==1.4.17
+# GPU inference. The default PyPI wheels are CPU-only; for an NVIDIA GPU use the
+# CUDA index instead (see yolo_device.cuda_install_hint() / health_check.py):
+#   python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch==2.14.0
+torchvision==0.29.0
+# Tests.
+pytest==9.0.2

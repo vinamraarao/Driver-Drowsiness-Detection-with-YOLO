@@ -9,6 +9,7 @@ import cv2
 from ultralytics import YOLO
 
 import config
+import yolo_device
 
 
 @dataclass
@@ -20,11 +21,12 @@ class YoloSnapshot:
 
 
 class YoloWorker:
-    def __init__(self, model, scale, interval_sec, conf_fn):
+    def __init__(self, model, scale, interval_sec, conf_fn, device=None):
         self.model = model
         self.scale = scale
         self.interval_sec = interval_sec
         self.conf_fn = conf_fn
+        self.device = device   # resolved once at startup: "0" on CUDA, "cpu" otherwise
         self._lock = threading.Lock()
         self._frame = None
         self._night = False
@@ -84,7 +86,7 @@ class YoloWorker:
                     person_conf, phone_conf = self.conf_fn(night)
                     persons, phones = run_yolo_scaled(
                         self.model, frame, self.scale, person_conf, phone_conf,
-                        imgsz=config.YOLO_IMAGE_SIZE, device=config.YOLO_DEVICE,
+                        imgsz=config.YOLO_IMAGE_SIZE, device=self.device,
                     )
                     with self._lock:
                         self._snapshot = YoloSnapshot(persons, phones, time.monotonic(), None)
@@ -105,10 +107,20 @@ class YoloWorker:
 
 def load_yolo_model():
     """Load YOLO11n. Ultralytics downloads the pretrained asset on first use."""
+    from yolo_device import describe_device
+
+    info = describe_device()
+    print(f"[INFO] Inference device: {info['device']} ({info['reason']})")
+    if info["requested"] == "auto" and not info["cuda_available"]:
+        print(yolo_device.cuda_install_hint())
     path = Path(config.YOLO_MODEL_PATH)
     if path.exists():
         print(f"[INFO] Loading YOLO model: {path}")
         return YOLO(str(path))
+    if not getattr(config, "AUTO_DOWNLOAD_YOLO_MODEL", True):
+        raise FileNotFoundError(
+            f"Missing YOLO weights: {path} and AUTO_DOWNLOAD_YOLO_MODEL is False."
+        )
     print(f"[INFO] Loading {config.YOLO_MODEL_NAME}; first run may download the weights.")
     model = YOLO(config.YOLO_MODEL_NAME)
     # Best-effort local copy for offline future runs.

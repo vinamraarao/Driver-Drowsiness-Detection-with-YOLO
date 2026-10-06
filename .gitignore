@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.backup
+*.backup*
+*.bak
+*.bak*
+*.before_fix
+*.csv
+.env
+.env.*

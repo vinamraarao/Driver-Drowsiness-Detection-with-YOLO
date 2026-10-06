@@ -23,18 +23,22 @@ from audio_alert import (
 )
 from camera_utils import open_camera, sync_camera_to_light_mode
 from event_logger import EventLogger
-from geometry import box_center, box_containment_ratio, box_iou, driver_side_score, expand_box, is_driver_box
+from geometry import box_center, box_containment_ratio, driver_side_score, expand_box, is_driver_box
+from head_pose import classify_yaw
 from hand_analyzer import analyze_hands, classify_driver_hands, create_hand_landmarker, draw_hands
 from face_analyzer import analyze_frame, create_face_landmarker, new_mp_image
 from hud import draw_alert_banner, draw_hud_panel, draw_zone_gridlines, get_screen_size, letterbox_to_screen
 from night_vision import NightModeState, apply_night_vision_tint, enhance_for_low_light
 from temporal_state import DriverState
+import yolo_device
 from yolo_detector import YoloWorker, confidence_thresholds_for_mode, load_yolo_model
+import calibration
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Driver monitoring system")
-    parser.add_argument("--camera-index", type=int, default=None)
+    parser.add_argument("--camera-index", type=int, default=None,
+                        help=f"Camera index to try first (default {config.DEFAULT_CAMERA_INDEX} on Windows when not given)")
     parser.add_argument("--backend", choices=["dshow", "msmf", "default"], default=None)
     parser.add_argument("--windowed", action="store_true", help="Use a normal window instead of fullscreen")
     parser.add_argument("--camera-only", action="store_true", help="Camera display without AI models")
@@ -43,6 +47,22 @@ def parse_args():
 
 def driver_side_in_image():
     return config.DRIVER_SIDE if config.FLIP_FRAME else ("left" if config.DRIVER_SIDE == "right" else "right")
+
+
+def classify_head_pose(face, driver_side=None, flip_frame=None):
+    """(label, distracted) for a FaceFrameResult.
+
+    driver_side is the side the driver sits on in the car (config.DRIVER_SIDE); it only
+    selects the left/right wording. flip_frame is the display mirror and does not change
+    whether a pose counts as distracted. No face or no matrix -> never distracted.
+    """
+    if driver_side is None:
+        driver_side = driver_side_in_image()
+    if flip_frame is None:
+        flip_frame = config.FLIP_FRAME
+    if not face.face_detected or face.head_pose_yaw_deg is None:
+        return "Center Focus", False
+    return classify_yaw(face.head_pose_yaw_deg, config.HEAD_YAW_THRESHOLD_DEG, driver_side, flip_frame)
 
 
 def choose_driver_box(person_boxes, face_bbox, w, driver_side):
@@ -73,7 +93,7 @@ def main():
     args = parse_args()
     if platform.system() == "Windows":
         if args.camera_index is None:
-            args.camera_index = 0
+            args.camera_index = config.DEFAULT_CAMERA_INDEX
         if args.backend is None:
             args.backend = "dshow"
 
@@ -118,10 +138,27 @@ def main():
         yolo_model = load_yolo_model()
         face_landmarker = create_face_landmarker()
         hand_landmarker = create_hand_landmarker()
-        yolo_worker = YoloWorker(yolo_model, config.YOLO_INFER_SCALE, config.YOLO_INTERVAL_SEC, confidence_thresholds_for_mode)
+        # Pass the resolved device (GPU index or "cpu"), not config.YOLO_DEVICE, so the
+        # background thread is not re-resolving on every inference.
+        yolo_worker = YoloWorker(yolo_model, config.YOLO_INFER_SCALE, config.YOLO_INTERVAL_SEC,
+                                 confidence_thresholds_for_mode, device=yolo_device.resolve_device())
+
+        # ---- Driver calibration: collect a short baseline, then derive thresholds ----
+        thresholds = calibration.ThresholdStore()
+        if config.ENABLE_CALIBRATION:
+            try:
+                print("[INFO] Collecting driver baseline for EAR/MAR calibration...")
+                cal = calibration.run_calibration(
+                    face_landmarker, config.CALIBRATION_DURATION_SEC, config.CALIBRATION_MIN_SAMPLES
+                )
+                thresholds.apply(cal)
+                print(f"[INFO] Calibration: {cal.reason}; EAR={thresholds.ear_threshold:.3f} "
+                      f"MAR={thresholds.mar_threshold:.3f}")
+            except Exception as exc:
+                print(f"[WARN] Calibration failed: {exc}; using safe defaults")
 
         driver_side = driver_side_in_image()
-        state = DriverState()
+        state = DriverState(thresholds=thresholds)
         night = NightModeState()
         camera_night_mode = False
         bad_frames = 0
@@ -133,6 +170,9 @@ def main():
         last_yolo_ts = 0.0
         last_alert = "System Nominal"
         last_head_pose = "Center Focus"
+        last_hands_ts = 0.0
+        hands_stale = True
+        driver_hands = []
 
         while True:
             ret, raw = cap.read()
@@ -154,6 +194,7 @@ def main():
                     phone_confirms = phone_misses = 0
                     phone_present = False
                     last_yolo_ts = 0.0
+                    hands_stale = True
                     bad_frames = 0
                 # Keep the same OpenCV window alive while reconnecting.
                 placeholder = np.zeros((config.CAM_HEIGHT, config.CAM_WIDTH, 3), dtype=np.uint8)
@@ -197,28 +238,25 @@ def main():
                 cv2.rectangle(display_frame, (fx, fy), (fx + fw, fy + fh), (255, 255, 0), 2)
                 avg_ear = state.update_eyes(face.avg_ear, now)
                 mar = state.update_yawn(face.mar, now)
-                pose_ratio = state.pose_smoother.update(face.head_pose_x_ratio)
-                if pose_ratio is None:
-                    pose_ratio = 0.5
-                if pose_ratio < config.HEAD_RIGHT_THRESHOLD:
-                    head_pose = "Looking Right"
-                    last_head_pose = head_pose
-                    state.update_distraction(True, now)
-                elif pose_ratio > config.HEAD_LEFT_THRESHOLD:
-                    head_pose = "Looking Left"
-                    last_head_pose = head_pose
-                    state.update_distraction(True, now)
-                else:
-                    head_pose = "Center Focus"
-                    last_head_pose = head_pose
+                pose_yaw = state.pose_smoother.update(face.head_pose_yaw_deg)
+                if pose_yaw is None:  # transformation matrix unavailable: pose unknown
+                    head_pose = last_head_pose if not state.face_lost else "Face Lost"
                     state.update_distraction(False, now)
-                eye_status = f"Closed EAR {avg_ear:.2f}" if avg_ear < config.EAR_THRESHOLD else f"Open EAR {avg_ear:.2f}"
-                yawn_status = f"Yawning MAR {mar:.2f}" if mar > config.MAR_THRESHOLD else f"Normal MAR {mar:.2f}"
+                else:
+                    head_pose, distracted = classify_head_pose(face, driver_side)
+                    last_head_pose = head_pose
+                    state.update_distraction(distracted, now)
+                ear_threshold = state.thresholds.ear_threshold
+                mar_threshold = state.thresholds.mar_threshold
+                eye_status = f"Closed EAR {avg_ear:.2f}" if avg_ear < ear_threshold else f"Open EAR {avg_ear:.2f}"
+                yawn_status = f"Yawning MAR {mar:.2f}" if mar > mar_threshold else f"Normal MAR {mar:.2f}"
             else:
-                head_pose = last_head_pose if not state.face_lost else "Face Lost"
+                # state.face_lost is True only once the face has been missing for
+                # FACE_GRACE_SEC; before that the last known pose is still held.
+                head_pose = "Face Lost" if state.face_lost else last_head_pose
                 eye_status = "Face unavailable"
                 yawn_status = "Face unavailable"
-                # Do not count missing face as closed eyes or distraction.
+                # Do not count a missing face as closed eyes or distraction.
                 state.update_distraction(False, now)
                 avg_ear = None
                 mar = None
@@ -240,36 +278,53 @@ def main():
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
             # Phone temporal confirmation: only update on a new YOLO result.
+            # When YOLO is stale/missing, hold the previous phone state instead of
+            # clearing it immediately — one bad YOLO frame must not remove a valid
+            # phone state. Clear only after PHONE_RESULT_TIMEOUT_SEC of no fresh result.
             current_yolo_ts = 0.0 if snap is None else snap.timestamp
             if not yolo_ok or current_yolo_ts <= 0.0:
-                phone_confirms = 0
-                phone_misses = 0
-                phone_present = False
+                if phone_present and (now - last_yolo_ts) >= config.PHONE_RESULT_TIMEOUT_SEC:
+                    phone_confirms = 0
+                    phone_misses = 0
+                    phone_present = False
             elif current_yolo_ts != last_yolo_ts:
                 last_yolo_ts = current_yolo_ts
-                candidate = any(phone_candidate(p, driver_box, w, h) for p in phone_boxes)
-                if candidate:
-                    phone_misses = 0
-                    phone_confirms = min(config.PHONE_CONFIRMATION_LIMIT, phone_confirms + 1)
-                    if phone_confirms >= config.PHONE_CONFIRMATION_LIMIT:
-                        phone_present = True
-                else:
+                # No driver box -> no phone alert, even if YOLO sees a phone.
+                if driver_box is None:
                     phone_confirms = 0
                     phone_misses += 1
                     if phone_misses >= config.PHONE_CLEAR_CONFIRMATIONS:
                         phone_present = False
+                else:
+                    candidate = any(phone_candidate(p, driver_box, w, h) for p in phone_boxes)
+                    if candidate:
+                        phone_misses = 0
+                        phone_confirms = min(config.PHONE_CONFIRMATION_LIMIT, phone_confirms + 1)
+                        if phone_confirms >= config.PHONE_CONFIRMATION_LIMIT:
+                            phone_present = True
+                    else:
+                        phone_confirms = 0
+                        phone_misses += 1
+                        if phone_misses >= config.PHONE_CLEAR_CONFIRMATIONS:
+                            phone_present = False
                 for pbox in phone_boxes:
                     if driver_box and phone_candidate(pbox, driver_box, w, h):
                         cv2.rectangle(display_frame, (int(pbox[0]), int(pbox[1])), (int(pbox[2]), int(pbox[3])), (0, 0, 255), 3)
 
-            # Hands.
-            hands = analyze_hands(hand_landmarker, mp_image, ts_ms, w, h)
-            driver_hands, passenger_hands = classify_driver_hands(hands, driver_box)
-            state.update_hands(len(driver_hands), now)
-            if driver_hands:
-                draw_hands(display_frame, [p for p, _ in driver_hands], (0, 255, 0))
-            if passenger_hands:
-                draw_hands(display_frame, [p for p, _ in passenger_hands], (0, 165, 255))
+            # Hands. The hand landmarker costs 18-23 ms per frame, so it is skipped
+            # entirely when hand alerts are off and runs at HAND_INTERVAL_SEC (5 Hz)
+            # when they are on. Results stay valid for one interval before counting as stale.
+            if config.ENABLE_HAND_ALERTS or driver_box is not None:
+                if (now - last_hands_ts) >= config.HAND_INTERVAL_SEC or hands_stale:
+                    last_hands_ts = now
+                    hands = analyze_hands(hand_landmarker, mp_image, ts_ms, w, h)
+                    driver_hands, passenger_hands = classify_driver_hands(hands, driver_box)
+                    hands_stale = False
+                    state.update_hands(len(driver_hands), now)
+                    if driver_hands:
+                        draw_hands(display_frame, [p for p, _ in driver_hands], (0, 255, 0))
+                    if passenger_hands:
+                        draw_hands(display_frame, [p for p, _ in passenger_hands], (0, 165, 255))
 
             # Alert priority.
             active_alert = "System Nominal"
@@ -287,7 +342,10 @@ def main():
                 active_alert = "MOBILE PHONE USAGE DETECTED"
                 alert_color = (0, 0, 255)
                 alert_kind = "phone"
-            elif state.drowsy_active:
+            elif state.drowsy_active or (
+                getattr(state, "perclos", 0.0) >= config.PERCLOS_DROWSY_THRESHOLD
+                and not state.sleep_active
+            ):
                 active_alert = "WARNING: DROWSINESS DETECTED"
                 alert_color = (0, 165, 255)
                 alert_kind = "drowsiness"
@@ -330,6 +388,7 @@ def main():
                 f"Pose:{head_pose}",
                 f"Phone:{'VIOLATION' if phone_present else 'Clean'}",
                 f"Yawn:{'YES' if state.yawn_active else 'NO'}",
+                f"Perclos:{getattr(state, 'perclos', 0.0):.0f}%",
                 f"Hands:{len(driver_hands)}",
                 f"Light:{night.last_luma:.0f}",
                 f"YOLO:{'OK' if yolo_ok else 'WAIT'}",
@@ -376,6 +435,7 @@ def main():
             pass
         if voice_started:
             shutdown_voice()
+            voice_started = False
         print(f"[INFO] Event log: {config.LOG_FILE}")
     return 0
 

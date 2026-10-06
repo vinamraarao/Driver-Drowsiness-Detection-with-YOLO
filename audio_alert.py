@@ -1,87 +1,143 @@
-"""
-audio_alert.py
---------------
-Voice-only alert system for the hardened driver monitoring system.
+"""Voice-only alert system for the driver monitoring system.
 
-Windows / SAPI5:
-- Creates a fresh pyttsx3 engine for every utterance.
-- Does not reuse a long-lived SAPI5 engine.
-- No audible beep is generated.
-- Keeps compatibility functions used by older/newer main.py versions.
+Design constraints:
+  * The camera loop must never block on audio. Every ``voice_alert`` call
+    returns immediately after a cheap cooldown check and a queue put.
+  * At most one bounded worker thread owns the SAPI5 engine and speaks one
+    message at a time.
+  * ``shutdown_voice()`` stops the worker and waits briefly for the current
+    utterance, so the process is silent on exit.
+  * No beep path exists.
 """
 
+import queue
 import threading
 import time
 
 import config
 
-_lock = threading.Lock()
-_voice_lock = threading.Lock()
-_last_voice_times = {}
 
+class _VoiceService:
+    def __init__(self):
+        self._queue = queue.Queue(maxsize=max(1, int(getattr(config, "VOICE_QUEUE_SIZE", 3))))
+        self._lock = threading.Lock()
+        self._last_times = {}
+        self._stop = threading.Event()
+        self._current = None
+        self._started = False
+        self._thread = None
 
-def _speak_now(message):
-    """Speak one message using a fresh SAPI5 engine."""
-    if not getattr(config, "VOICE_ENABLED", True):
-        return False
+    # -- lifecycle ---------------------------------------------------
+    def start(self):
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            self._thread = threading.Thread(target=self._worker, name="VoiceAlert", daemon=True)
+            self._thread.start()
 
-    try:
-        import pyttsx3
-
-        # A fresh engine per utterance avoids the common Windows/SAPI5
-        # failure where a reused engine speaks once and then goes silent.
-        with _voice_lock:
-            engine = pyttsx3.init("sapi5")
-            engine.setProperty("rate", getattr(config, "VOICE_RATE", 165))
-            engine.setProperty("volume", getattr(config, "VOICE_VOLUME", 1.0))
-
-            engine.say(message)
-            engine.runAndWait()
-
+    def stop(self, timeout=3.0):
+        thread = self._thread
+        if thread is not None:
+            self._stop.set()
+            try:
+                thread.join(timeout=timeout)
+            except Exception:
+                pass
+        engine = self._current
+        if engine is not None:
             try:
                 engine.stop()
             except Exception:
                 pass
+            self._current = None
 
-        print(f"[VOICE] Spoken: {message}")
+    # -- enqueue -----------------------------------------------------
+    def submit(self, message, key, cooldown):
+        now = time.monotonic()
+        with self._lock:
+            last = self._last_times.get(key)
+            if last is not None and (now - last) < cooldown:
+                return False
+            self._last_times[key] = now
+            if not self._started:
+                self._started = True
+                self._thread = threading.Thread(target=self._worker, name="VoiceAlert", daemon=True)
+                self._thread.start()
+        try:
+            self._queue.put_nowait((now, message))
+        except queue.Full:
+            # Drop the oldest pending message so the newest alert wins.
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait((now, message))
+            except Exception:
+                return False
         return True
 
-    except Exception as exc:
-        print(f"[VOICE ERROR] Speech failed: {exc}")
-        return False
+    # -- worker ------------------------------------------------------
+    def _worker(self):
+        engine = None
+        try:
+            while not self._stop.is_set():
+                try:
+                    _, message = self._queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if self._stop.is_set():
+                    break
+                try:
+                    if engine is None:
+                        engine = self._make_engine()
+                        self._current = engine
+                    if engine is not None:
+                        engine.say(message)
+                        engine.runAndWait()
+                    print(f"[VOICE] Spoken: {message}")
+                except Exception as exc:
+                    print(f"[VOICE ERROR] Worker failed: {exc}")
+                    # A dead SAPI5 engine must not poison later alerts.
+                    if engine is not None:
+                        try:
+                            engine.stop()
+                        except Exception:
+                            pass
+                        engine = None
+                        self._current = None
+        finally:
+            if engine is not None:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+            self._current = None
+
+    @staticmethod
+    def _make_engine():
+        import pyttsx3
+        engine = pyttsx3.init("sapi5")
+        engine.setProperty("rate", getattr(config, "VOICE_RATE", 165))
+        engine.setProperty("volume", getattr(config, "VOICE_VOLUME", 1.0))
+        return engine
 
 
-def _speak_worker(message):
-    try:
-        _speak_now(message)
-    except Exception as exc:
-        print(f"[VOICE ERROR] Worker failed: {exc}")
+_service = _VoiceService()
+
+
+def _cooldown_for(key, override):
+    if override is not None:
+        return float(override)
+    table = getattr(config, "VOICE_COOLDOWNS", None)
+    if isinstance(table, dict) and key in table:
+        return float(table[key])
+    return float(getattr(config, "VOICE_DEFAULT_COOLDOWN_SEC", 4.0))
 
 
 def voice_alert(message, alert_key="general", cooldown=None):
-    """Speak a non-blocking voice alert with a per-alert cooldown."""
+    """Queue one alert. Returns True when queued, False when suppressed."""
     if not getattr(config, "VOICE_ENABLED", True):
         return False
-
-    if cooldown is None:
-        cooldown = getattr(config, "VOICE_ALERT_COOLDOWN_SEC", 8.0)
-
-    now = time.monotonic()
-
-    with _lock:
-        last_time = _last_voice_times.get(alert_key, 0.0)
-        if now - last_time < cooldown:
-            return False
-        _last_voice_times[alert_key] = now
-
-    threading.Thread(
-        target=_speak_worker,
-        args=(message,),
-        name="VoiceAlert",
-        daemon=True,
-    ).start()
-
-    return True
+    return _service.submit(message, alert_key, _cooldown_for(alert_key, cooldown))
 
 
 def alert_beep(frequency=0, duration=0):
@@ -105,8 +161,9 @@ def phone_alert():
 
 def sleep_and_phone_alert():
     return voice_alert(
-        "Critical warning! Driver sleep and mobile phone usage detected. Please put the phone away, wake up, and focus on the road.",
-        alert_key="sleep_and_phone",
+        "Critical warning! Driver sleep and mobile phone usage detected. "
+        "Please put the phone away, wake up, and focus on the road.",
+        alert_key="sleep_phone",
         cooldown=6.0,
     )
 
@@ -142,15 +199,13 @@ def hands_off_wheel_alert():
 def hands_not_visible_alert():
     return voice_alert(
         "Warning! Driver hands are not visible. Please keep your hands on the steering wheel.",
-        alert_key="hands_not_visible",
+        alert_key="hands",
     )
 
 
 def shutdown_voice():
-    """Compatibility shutdown hook used by the hardened main.py."""
-    # There is no persistent engine to stop. Current speech workers are
-    # daemon threads and each owns its own temporary engine instance.
-    return None
+    """Stop the worker; the queue is drained so nothing speaks after exit."""
+    _service.stop()
 
 
 def stop():

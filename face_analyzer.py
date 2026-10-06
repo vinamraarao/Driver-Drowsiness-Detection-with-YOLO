@@ -9,15 +9,21 @@ from mediapipe.tasks.python import vision as mp_vision
 
 import config
 from geometry import eye_aspect_ratio, face_bbox_from_landmarks, landmarks_to_px, mouth_aspect_ratio
+from head_pose import euler_degrees_from_matrix
 
 
 class FaceFrameResult:
-    __slots__ = ("face_detected", "bbox", "head_pose_x_ratio", "avg_ear", "mar", "error")
+    __slots__ = ("face_detected", "bbox", "head_pose_yaw_deg", "head_pose_pitch_deg",
+                 "head_pose_roll_deg", "head_pose_source", "avg_ear", "mar", "error")
 
     def __init__(self):
         self.face_detected = False
         self.bbox = None
-        self.head_pose_x_ratio = None
+        self.head_pose_yaw_deg = None
+        self.head_pose_pitch_deg = None
+        self.head_pose_roll_deg = None
+        # "matrix" when the facial transformation matrix was decoded, "none" otherwise.
+        self.head_pose_source = "none"
         self.avg_ear = None
         self.mar = None
         self.error = None
@@ -70,7 +76,8 @@ def create_face_landmarker():
         min_face_presence_confidence=0.5,
         min_tracking_confidence=0.5,
         output_face_blendshapes=False,
-        output_facial_transformation_matrixes=False,
+        # Required for real yaw/pitch/roll. Disable only if CPU cost becomes a problem.
+        output_facial_transformation_matrixes=True,
     )
     return mp_vision.FaceLandmarker.create_from_options(options)
 
@@ -96,9 +103,17 @@ def analyze_frame(face_landmarker, mp_image, timestamp_ms, w, h):
     if not result.face_detected:
         return result
 
-    fx, fy, fw, fh = bbox
-    nose_x = pts[config.NOSE_TIP_IDX][0]
-    result.head_pose_x_ratio = (nose_x - fx) / fw if fw > 1 else 0.5
+    # Head pose: prefer MediaPipe's facial transformation matrix (a 4x4 row-major numpy
+    # array). If it is missing (older .task bundle, or a model without the geometry
+    # pipeline) yaw stays None and the caller treats the pose as unknown rather than
+    # guessing from the nose.
+    matrices = getattr(mesh, "facial_transformation_matrixes", None)
+    if matrices is not None and len(matrices) > 0:
+        angles = euler_degrees_from_matrix(matrices[0])
+        if angles is not None:
+            result.head_pose_yaw_deg, result.head_pose_pitch_deg, result.head_pose_roll_deg = angles
+            result.head_pose_source = "matrix"
+
     result.avg_ear = (
         eye_aspect_ratio(pts, config.LEFT_EYE_EAR_IDX)
         + eye_aspect_ratio(pts, config.RIGHT_EYE_EAR_IDX)

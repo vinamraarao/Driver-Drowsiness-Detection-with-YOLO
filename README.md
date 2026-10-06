@@ -58,25 +58,54 @@ driver_monitoring_final/
 
 ## Manual setup (Windows)
 
-Use Python 3.12 for the most predictable install on this stack.
+Use Python 3.12 for the most predictable install on this stack. Run everything
+from the `venv/` in this folder (the system Python does not have cv2).
+
 ```
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python health_check.py
-python main.py
+python -m venv venv
+venv\Scripts\python -m pip install --upgrade pip
+venv\Scripts\python -m pip install -r requirements.txt
+venv\Scripts\python health_check.py
+venv\Scripts\python main.py
 ```
 
 The first run may download the YOLO11n weights. The face and hand MediaPipe
 task files are already included in this package.
 
+### GPU
+
+`health_check.py` reports the inference device that will be used. The default
+`YOLO_DEVICE = "auto"` uses the NVIDIA GPU when `torch.cuda.is_available()` is
+true and falls back to CPU otherwise. The stock `torch` wheels are CPU-only; to
+use an RTX-class GPU install the CUDA build yourself (nothing is installed
+automatically):
+
+```
+venv\Scripts\python -m pip uninstall -y torch torchvision
+venv\Scripts\python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+venv\Scripts\python health_check.py
+```
+
+Set `YOLO_DEVICE = "cpu"` or `YOLO_FORCE_CPU = True` in `config.py` to force CPU.
+
+### Tests
+
+```
+venv\Scripts\python -m pip install pytest
+venv\Scripts\python -m pytest tests -q
+```
+
 ### Useful flags
 
 ```bat
+:: Default camera (index 1, see DEFAULT_CAMERA_INDEX in config.py)
+python main.py
+
 :: Use a specific camera
-python main.py --camera-index 1
+python main.py --camera-index 0
 
 :: Force a different Windows camera backend
-python main.py --camera-index 0 --backend msmf
+python main.py --camera-index 1 --backend msmf
 
 :: Normal resizable window instead of fullscreen
 python main.py --windowed
@@ -84,6 +113,27 @@ python main.py --windowed
 
 ## What was fixed
 
+- **Night mode stays real-time.** `cv2.fastNlMeansDenoising` (180-350 ms per
+  640x480 frame) is disabled by default (`DENOISE_H_NIGHT = 0`); CLAHE + gamma
+  + unsharp costs about 3 ms. Night enter/exit luma thresholds were recalibrated
+  from the measured cabin (dark cabin ~16-32, daylight ~120-160) so night mode
+  does not latch on in a normal cabin.
+- **The hand landmarker is gated.** It is not run at all when
+  `ENABLE_HAND_ALERTS = False`, and runs at 5 Hz (`HAND_INTERVAL_SEC = 0.2`)
+  when enabled. It costs 18-23 ms per frame.
+- **Inference device is chosen at startup** (`YOLO_DEVICE = "auto"`): GPU when
+  CUDA is available, CPU otherwise, with the reason printed by `health_check.py`
+  and `load_yolo_model()`.
+- **Voice alerts use one bounded worker and a bounded queue.** `voice_alert`
+  returns immediately after a cooldown check; the per-key cooldowns in
+  `VOICE_COOLDOWNS` are used (the old `VOICE_ALERT_COOLDOWN_SEC` reference never
+  existed and silently forced every alert to 8 s); `shutdown_voice()` stops the
+  worker so nothing speaks after exit.
+- **Drowsiness state no longer blinks itself away.** A single blink does not
+  clear `drowsy_active`; `sleep_active` clears only after `RECOVERY_DURATION_SEC`
+  of continuously open eyes; and when the face has been missing for
+  `FACE_GRACE_SEC` the sleep, drowsy, yawn and pose state plus all three
+  smoothers are dropped, so "DRIVER SLEEP" can never fire with nobody in frame.
 - **Timers are time-based, not frame-based** — changing camera FPS no longer
   silently changes the meaning of the drowsiness/yawn/distraction thresholds.
 - **YOLO runs in a background worker** with a bounded "latest frame only"
