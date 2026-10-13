@@ -114,6 +114,17 @@ ENABLE_HAND_ALERTS = False   # When False the hand landmarker is not run at all 
 HAND_INTERVAL_SEC = 0.20    # Lower the hand rate to 5 Hz.
 HANDS_NOT_VISIBLE_SEC = 2.0
 
+# ---------------- Steering Wheel Hand Presence ----------------
+# Steering wheel region as [x1, y1, x2, y2] normalized coordinates (0.0-1.0)
+# Default: approximate center region where hands would be on wheel
+STEERING_WHEEL_ROI = [0.3, 0.3, 0.7, 0.7]  # [x_min, y_min, x_max, y_max]
+HAND_OFF_WHEEL_WARNING_1HAND = 30.0   # seconds for 1 hand off wheel warning
+HAND_OFF_WHEEL_HIGH_RISK_1HAND = 60.0 # seconds for 1 hand off wheel high risk
+HAND_OFF_WHEEL_WARNING_2HAND = 2.0    # seconds for 2 hands off wheel warning
+HAND_OFF_WHEEL_CRITICAL_2HAND = 5.0   # seconds for 2 hands off wheel critical
+HAND_OFF_WHEEL_CONFIRMATION_SEC = 0.5 # seconds of continuous state required to trigger
+HAND_OFF_WHEEL_RECOVERY_SEC = 1.0     # seconds of correct state to reset timers
+
 # ---------------- Night vision ----------------
 ENABLE_NIGHT_VISION = True
 # Recalibrated from measured native (un-enhanced) mean luma of this cabin:

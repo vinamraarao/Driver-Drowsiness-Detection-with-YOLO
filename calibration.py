@@ -16,10 +16,12 @@ class CalibrationResult:
     __slots__ = (
         "ear_threshold", "mar_threshold", "ear_baseline", "mar_baseline",
         "ear_samples", "mar_samples", "calibrated", "reason",
+        "ear_valid_samples", "ear_rejection_rate", "calibration_quality"
     )
 
     def __init__(self, ear_threshold, mar_threshold, ear_baseline, mar_baseline,
-                 ear_samples, mar_samples, calibrated, reason):
+                 ear_samples, mar_samples, calibrated, reason,
+                 ear_valid_samples=None, ear_rejection_rate=0.0, calibration_quality="unknown"):
         self.ear_threshold = ear_threshold
         self.mar_threshold = mar_threshold
         self.ear_baseline = ear_baseline
@@ -28,6 +30,9 @@ class CalibrationResult:
         self.mar_samples = mar_samples
         self.calibrated = calibrated
         self.reason = reason
+        self.ear_valid_samples = ear_valid_samples if ear_valid_samples is not None else len(ear_samples)
+        self.ear_rejection_rate = ear_rejection_rate
+        self.calibration_quality = calibration_quality
 
 
 def _clamp(value, lo, hi):
@@ -75,46 +80,154 @@ def collect_baseline(ear_fn, mar_fn, duration_sec=None, min_samples=None):
     return ear_samples, mar_samples
 
 
+def _is_valid_ear_sample(ear_value):
+    """Check if an EAR sample is valid for calibration.
+
+    Reject samples that are:
+    - Too low (< 0.08): indicates eyes mostly closed or landmark detection failure
+    - Too high (> 0.45): indicates landmark detection failure or unusual eye geometry
+    - Non-finite values
+    """
+    if not isinstance(ear_value, (int, float)) or not math.isfinite(ear_value):
+        return False
+    if ear_value < 0.08 or ear_value > 0.45:
+        return False
+    return True
+
+
+def _is_valid_mar_sample(mar_value):
+    """Check if a MAR sample is valid for calibration.
+
+    Reject samples that are:
+    - Too low (< 0.10): indicates mouth closed and landmarks stable, but if all
+      samples are this low it may indicate landmark detection issues
+    - Too high (> 2.0): indicates landmark detection failure
+    - Non-finite values
+    """
+    if not isinstance(mar_value, (int, float)) or not math.isfinite(mar_value):
+        return False
+    if mar_value < 0.10 or mar_value > 2.0:
+        return False
+    return True
+
+
 def derive_thresholds(ear_samples, mar_samples):
     """Derive EAR/MAR thresholds from baseline samples.
 
     Returns a CalibrationResult. Always returns usable thresholds: if the
     samples are degenerate, the safe defaults from config are used.
+
+    EAR and MAR are calibrated independently. If one fails quality checks,
+    its threshold falls back to the default while the other may still be calibrated.
+    The overall ``calibrated`` flag is True only if at least one threshold was
+    successfully calibrated.
     """
-    ear_mean = _safe_mean(ear_samples)
-    mar_mean = _safe_mean(mar_samples)
+    # Filter EAR samples to reject invalid/abnormally low values
+    valid_ear_samples = [ear for ear in ear_samples if _is_valid_ear_sample(ear)]
+    ear_rejection_rate = 0.0
+    if ear_samples:
+        ear_rejection_rate = 1.0 - (len(valid_ear_samples) / len(ear_samples))
 
-    if ear_mean is None or mar_mean is None:
-        return CalibrationResult(
-            config.EAR_THRESHOLD, config.MAR_THRESHOLD,
-            None, None, ear_samples, mar_samples, False,
-            "no face detected during calibration; using safe defaults",
-        )
+    # Filter MAR samples to reject invalid values
+    valid_mar_samples = [mar for mar in mar_samples if _is_valid_mar_sample(mar)]
+    mar_rejection_rate = 0.0
+    if mar_samples:
+        mar_rejection_rate = 1.0 - (len(valid_mar_samples) / len(mar_samples))
 
-    ear_std = _safe_std(ear_samples, ear_mean)
-    mar_std = _safe_std(mar_samples, mar_mean)
+    # Calculate means for both EAR and MAR (using filtered samples)
+    ear_mean = _safe_mean(valid_ear_samples)
+    mar_mean = _safe_mean(valid_mar_samples)
 
-    # EAR: eyes-closed threshold sits below the baseline mean by N standard
-    # deviations, clamped to a sane range. A blink or a small glance should not
-    # trigger drowsiness; only sustained closure should.
-    ear_offset = config.CALIBRATION_EAR_STDDEV_OFFSET * max(ear_std, 0.01)
-    ear_threshold = _clamp(ear_mean - ear_offset,
-                           config.EAR_CALIB_MIN, config.EAR_CALIB_MAX)
+    # Determine EAR calibration quality
+    min_valid_ear_samples = max(config.CALIBRATION_MIN_SAMPLES // 2, 5)  # At least half or 5 samples
+    sufficient_total_ears = len(ear_samples) >= config.CALIBRATION_MIN_SAMPLES  # Enough total samples collected
+    sufficient_valid_ears = len(valid_ear_samples) >= min_valid_ear_samples  # Enough valid samples
 
-    # MAR: yawning threshold sits above the baseline mean by N standard
-    # deviations, clamped to a sane range.
-    mar_offset = config.CALIBRATION_MAR_STDDEV_OFFSET * max(mar_std, 0.01)
-    mar_threshold = _clamp(mar_mean + mar_offset,
-                           config.MAR_CALIB_MIN, config.MAR_CALIB_MAX)
+    calibration_quality = "poor"
+    if sufficient_total_ears and sufficient_valid_ears and ear_rejection_rate < 0.5:  # Less than 50% rejection rate
+        calibration_quality = "good"
+    elif sufficient_total_ears and sufficient_valid_ears:
+        calibration_quality = "marginal"  # Enough total and valid samples but high rejection rate
+    elif sufficient_total_ears and not sufficient_valid_ears:
+        # Enough total samples collected but not enough valid ones = poor quality
+        calibration_quality = "poor"
+    # Note: if sufficient_total_ears is False, we'll handle it as "insufficient samples" below
 
-    calibrated = ear_threshold != config.EAR_THRESHOLD or mar_threshold != config.MAR_THRESHOLD
-    reason = "calibrated from {} EAR / {} MAR samples".format(
-        len(ear_samples), len(mar_samples))
+    # --- EAR threshold calculation ---
+    ear_threshold = config.EAR_THRESHOLD  # Default
+    ear_was_calibrated = False
+    if ear_mean is not None and sufficient_total_ears and calibration_quality in ("good", "marginal"):
+        ear_std = _safe_std(ear_samples, ear_mean)
+        ear_offset = config.CALIBRATION_EAR_STDDEV_OFFSET * max(ear_std, 0.01)
+        ear_threshold = _clamp(ear_mean - ear_offset,
+                               config.EAR_CALIB_MIN, config.EAR_CALIB_MAX)
+        ear_was_calibrated = (ear_threshold != config.EAR_THRESHOLD)
+        # If the calibrated EAR threshold is too low, fall back to default
+        if ear_threshold < 0.10:
+            ear_threshold = config.EAR_THRESHOLD
+            ear_was_calibrated = False
+
+    # --- MAR threshold calculation (independent of EAR) ---
+    mar_threshold = config.MAR_THRESHOLD  # Default
+    mar_was_calibrated = False
+    if mar_mean is not None and len(valid_mar_samples) >= min_valid_ear_samples:
+        mar_std = _safe_std(mar_samples, mar_mean)
+        mar_offset = config.CALIBRATION_MAR_STDDEV_OFFSET * max(mar_std, 0.01)
+        mar_threshold = _clamp(mar_mean + mar_offset,
+                               config.MAR_CALIB_MIN, config.MAR_CALIB_MAX)
+        mar_was_calibrated = (mar_threshold != config.MAR_THRESHOLD)
+
+    # Determine overall calibration status
+    calibrated = ear_was_calibrated or mar_was_calibrated
+
+    # Build reason message
+    reason_parts = []
+
+    # EAR reasoning
+    if len(ear_samples) == 0:
+        reason_parts.append("no EAR samples detected")
+    elif not sufficient_total_ears:
+        # Not enough total samples collected during calibration period
+        reason_parts.append(f"insufficient EAR samples collected ({len(ear_samples)}/{config.CALIBRATION_MIN_SAMPLES})")
+    elif len(valid_ear_samples) == 0:
+        # We have samples but none are valid = poor calibration quality
+        reason_parts.append(f"poor EAR calibration quality (all samples rejected)")
+    elif not sufficient_valid_ears:
+        # Enough total samples but not enough valid ones = poor quality
+        reason_parts.append(f"poor EAR calibration quality (insufficient valid samples: {len(valid_ear_samples)}/{len(ear_samples)})")
+    elif calibration_quality == "poor":
+        reason_parts.append(f"poor EAR calibration quality (rejection rate: {ear_rejection_rate:.1%})")
+    elif ear_was_calibrated:
+        reason_parts.append(f"EAR calibrated from {len(valid_ear_samples)} valid samples")
+    else:
+        reason_parts.append("EAR using default (calibration produced no improvement)")
+
+    # MAR reasoning
+    if len(mar_samples) == 0:
+        reason_parts.append("no MAR samples detected")
+    elif len(valid_mar_samples) == 0:
+        # We have samples but none are valid = poor calibration quality
+        reason_parts.append(f"poor MAR calibration quality (all samples rejected)")
+    else:
+        if mar_was_calibrated:
+            reason_parts.append(f"MAR calibrated from {len(valid_mar_samples)} valid samples")
+        else:
+            reason_parts.append("MAR using default threshold")
+
+    # Special case: if both EAR and MAR have no valid samples, indicate safe defaults
+    if len(valid_ear_samples) == 0 and len(valid_mar_samples) == 0:
+        reason_parts = ["using safe defaults"]
+
+    reason = "; ".join(reason_parts)
 
     return CalibrationResult(
         ear_threshold, mar_threshold,
         ear_mean, mar_mean,
-        ear_samples, mar_samples, calibrated, reason,
+        ear_samples, mar_samples, calibrated,
+        reason,
+        ear_valid_samples=len(valid_ear_samples),
+        ear_rejection_rate=ear_rejection_rate,
+        calibration_quality=calibration_quality
     )
 
 

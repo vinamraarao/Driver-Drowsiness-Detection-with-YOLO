@@ -6,6 +6,8 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 import argparse
 import platform
 import time
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -15,6 +17,7 @@ from audio_alert import (
     distraction_alert,
     drowsiness_alert,
     hands_not_visible_alert,
+    hands_off_wheel_alert,
     phone_alert,
     shutdown_voice,
     sleep_alert,
@@ -132,7 +135,7 @@ def main():
     hand_landmarker = None
     yolo_worker = None
     voice_started = True
-    logger = EventLogger(config.LOG_FILE)
+    logger = EventLogger(config.LOG_FILE, snapshot_dir=Path(__file__).parent / "snapshots")
 
     try:
         yolo_model = load_yolo_model()
@@ -326,6 +329,12 @@ def main():
                     if passenger_hands:
                         draw_hands(display_frame, [p for p, _ in passenger_hands], (0, 165, 255))
 
+            # Update hand-off-wheel monitoring
+            state.update_hand_off_wheel(hands if 'hands' in locals() else None, w, h, now=now)
+
+            # Update progressive alert level
+            state.update_alert_level(phone_present=phone_present, face_detected=face.face_detected, now=now)
+
             # Alert priority.
             active_alert = "System Nominal"
             alert_color = (0, 180, 0)
@@ -362,6 +371,35 @@ def main():
                 alert_color = (0, 165, 255)
                 alert_kind = "hands"
 
+            # Hand-off-wheel alert integration
+            hand_state, hand_duration, is_warning, is_high_risk, is_critical = state.get_hand_off_wheel_status(now)
+            if hand_state == "BOTH_OFF":
+                if is_critical:
+                    active_alert = "CRITICAL: BOTH HANDS OFF WHEEL"
+                    alert_color = (0, 0, 255)
+                    alert_kind = "hands_off_wheel_critical"
+                elif is_high_risk:
+                    active_alert = "HIGH RISK: BOTH HANDS OFF WHEEL"
+                    alert_color = (0, 165, 255)
+                    alert_kind = "hands_off_wheel_high"
+                else:
+                    active_alert = "WARNING: BOTH HANDS OFF WHEEL"
+                    alert_color = (0, 165, 255)
+                    alert_kind = "hands_off_wheel"
+            elif hand_state == "ONE_OFF":
+                if is_high_risk:
+                    active_alert = "HIGH RISK: ONE HAND OFF WHEEL"
+                    alert_color = (0, 165, 255)
+                    alert_kind = "hands_off_wheel_high"
+                elif is_warning:
+                    active_alert = "WARNING: ONE HAND OFF WHEEL"
+                    alert_color = (0, 165, 255)
+                    alert_kind = "hands_off_wheel"
+                else:
+                    active_alert = "LOW RISK: ONE HAND OFF WHEEL"
+                    alert_color = (0, 255, 0)
+                    alert_kind = "hands_off_wheel_low"
+
             if alert_kind == "sleep_phone":
                 sleep_and_phone_alert()
             elif alert_kind == "sleep":
@@ -376,20 +414,44 @@ def main():
                 distraction_alert()
             elif alert_kind == "hands":
                 hands_not_visible_alert()
+            elif alert_kind in ("hands_off_wheel_critical", "hands_off_wheel_high", "hands_off_wheel", "hands_off_wheel_low"):
+                hands_off_wheel_alert()
             else:
                 logger.reset()
-            logger.log(driver_status, "Driver" if driver_box else "N/A", active_alert)
+            # Prepare snapshot frame for high-risk events
+            snapshot_frame = display_frame.copy() if ("HIGH_RISK" in active_alert or "CRITICAL" in active_alert) else None
+            logger.log(driver_status, "Driver" if driver_box else "N/A", active_alert, snapshot_frame=snapshot_frame)
+
+            # Calculate risk score (0-100, higher = more risk)
+            risk_score = state.calculate_risk_score(phone_present=phone_present, face_detected=face.face_detected)
 
             # Display metrics.
+            hand_state, hand_duration, _, _, _ = state.get_hand_off_wheel_status(now)
+            if hand_state == "BOTH_ON":
+                hand_status = "BOTH HANDS ON WHEEL"
+            elif hand_state == "ONE_OFF":
+                if hand_duration >= getattr(config, 'HAND_OFF_WHEEL_WARNING_1HAND', 30.0):
+                    hand_status = "ONE HAND OFF WHEEL (WARNING)"
+                else:
+                    hand_status = "ONE HAND OFF WHEEL"
+            else:
+                if hand_duration >= getattr(config, 'HAND_OFF_WHEEL_CRITICAL_2HAND', 5.0):
+                    hand_status = "BOTH HANDS OFF WHEEL (CRITICAL)"
+                elif hand_duration >= getattr(config, 'HAND_OFF_WHEEL_WARNING_2HAND', 2.0):
+                    hand_status = "BOTH HANDS OFF WHEEL (WARNING)"
+                else:
+                    hand_status = "BOTH HANDS OFF WHEEL"
             metrics = [
                 f"Cabin:{driver_status}",
                 f"Face:{'OK' if face.face_detected else 'NO'}",
                 f"Eyes:{'Closed' if state.drowsy_active else 'Open/Scan'}",
+                f"Risk:{risk_score}%",
                 f"Pose:{head_pose}",
                 f"Phone:{'VIOLATION' if phone_present else 'Clean'}",
                 f"Yawn:{'YES' if state.yawn_active else 'NO'}",
                 f"Perclos:{getattr(state, 'perclos', 0.0):.0f}%",
                 f"Hands:{len(driver_hands)}",
+                f"Hand Status:{hand_status}",
                 f"Light:{night.last_luma:.0f}",
                 f"YOLO:{'OK' if yolo_ok else 'WAIT'}",
             ]
